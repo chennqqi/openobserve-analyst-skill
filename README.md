@@ -1,3 +1,5 @@
+
+
 # openobserve-analyst-skill
  
  中文版: [README.md](https://github.com/chennqqi/openobserve-analyst-skill/blob/main/README.md)
@@ -34,7 +36,7 @@
 - 列出日志流
 - 查看 Stream Schema
 - 拉取最新日志
-- 检索错误 / 告警相关日志
+- 检索错误 / 警告相关日志
 - 执行自定义 SQL 查询
 - 汇总日志级别统计
 
