@@ -10,6 +10,9 @@ LOGS Commands:
   tail        Get latest N log entries
   errors      Find error/warning logs
   summary     Summarize log counts by level
+  around      Fetch logs around a timestamp
+  values      List distinct field values
+  histogram   Time-bucketed log counts
 
 METRICS Commands:
   metrics-query       Instant PromQL query
@@ -29,11 +32,16 @@ Environment variables (required):
   OO_ORG        organization name (default: default)
   OO_USER       username
   OO_PASSWORD   password
+
+Optional:
+  OO_TZ         timezone for naive timestamps (default: UTC)
+  OO_TIMEOUT    HTTP timeout in seconds (default: 60)
 """
 
 import os
 import sys
 import json
+import re
 import base64
 import argparse
 import time
@@ -44,8 +52,44 @@ from urllib.parse import urlencode, quote
 
 
 # ---------------------------------------------------------------------------
+# .env auto-loader (env vars still take precedence)
+# Reads scripts/.env, then skill-root .env.
+# ---------------------------------------------------------------------------
+
+def _load_dotenv():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    env_path = None
+    for cand in (script_dir, os.path.dirname(script_dir)):
+        path = os.path.join(cand, ".env")
+        if os.path.isfile(path):
+            env_path = path
+            break
+    if not env_path:
+        return
+    try:
+        with open(env_path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key, value = key.strip(), value.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = value
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
+
+_REL_TIME = re.compile(r"^(\d+)([mhd])$")
+_COMPACT_FIELDS = ("_timestamp", "level", "status", "event", "service", "message", "log", "msg")
+_ERROR_BODY_LIMIT = 500
+_MSG_FALLBACK_LIMIT = 500
+_CELL_LIMIT = 80
+
 
 def get_auth_header(user: str, password: str) -> str:
     token = base64.b64encode(f"{user}:{password}".encode()).decode()
@@ -60,44 +104,172 @@ def now_s() -> int:
     return int(time.time())
 
 
+def http_timeout() -> float:
+    try:
+        return float(os.environ.get("OO_TIMEOUT", "60"))
+    except ValueError:
+        return 60.0
+
+
+def configured_tz():
+    name = os.environ.get("OO_TZ", "UTC")
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(name)
+    except Exception:
+        return timezone.utc
+
+
+def parse_absolute_us(spec: str) -> int:
+    """Parse an absolute timestamp into microseconds."""
+    spec = spec.strip()
+    if spec.isdigit():
+        n = int(spec)
+        if n >= 10**15:
+            return n
+        if n >= 10**12:
+            return n * 1000
+        return n * 1_000_000
+    normalized = spec.replace("Z", "+00:00")
+    dt = None
+    try:
+        dt = datetime.fromisoformat(normalized)
+    except ValueError:
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+            try:
+                dt = datetime.strptime(spec, fmt)
+                break
+            except ValueError:
+                continue
+    if dt is None:
+        raise ValueError(
+            f"Invalid time spec '{spec}'. Use 15m/1h/2d or an absolute timestamp."
+        )
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=configured_tz())
+    return int(dt.timestamp() * 1_000_000)
+
+
+def parse_time_us(spec: str) -> int:
+    """Relative (15m/1h/2d → now-offset) or absolute timestamp, in microseconds."""
+    spec = spec.strip()
+    match = _REL_TIME.match(spec)
+    if match:
+        value = int(match.group(1))
+        unit = match.group(2)
+        multipliers = {"m": 60, "h": 3600, "d": 86400}
+        return now_us() - value * multipliers[unit] * 1_000_000
+    return parse_absolute_us(spec)
+
+
 def parse_time_offset_us(spec: str) -> int:
     """Return absolute start time in microseconds."""
-    unit = spec[-1]
-    value = int(spec[:-1])
-    multipliers = {'m': 60, 'h': 3600, 'd': 86400}
-    if unit not in multipliers:
-        raise ValueError(f"Unknown time unit '{unit}'. Use m/h/d.")
-    return now_us() - value * multipliers[unit] * 1_000_000
+    return parse_time_us(spec)
 
 
 def parse_time_offset_s(spec: str) -> int:
     """Return absolute start time in seconds (for Prometheus-compat APIs)."""
-    unit = spec[-1]
-    value = int(spec[:-1])
-    multipliers = {'m': 60, 'h': 3600, 'd': 86400}
-    if unit not in multipliers:
-        raise ValueError(f"Unknown time unit '{unit}'. Use m/h/d.")
-    return now_s() - value * multipliers[unit]
+    return parse_time_us(spec) // 1_000_000
 
 
-def api_request(method: str, url: str, headers: dict, body: dict = None) -> dict:
+def resolve_range_us(since: str, until: str = "") -> tuple:
+    start_us = parse_time_us(since)
+    end_us = parse_time_us(until) if until else now_us()
+    if start_us >= end_us:
+        print("[ERROR] --since must be earlier than --until / now.", file=sys.stderr)
+        sys.exit(1)
+    return start_us, end_us
+
+
+def choose_sql(positional="", sql_flag="", sql_file_text=None, stdin_text=None) -> str:
+    """Pick SQL from --sql-file, --sql, positional, or stdin. First non-empty wins."""
+    if sql_file_text:
+        return sql_file_text.strip()
+    if sql_flag:
+        return sql_flag.strip()
+    if positional and positional != "-":
+        return positional.strip()
+    if positional == "-" or stdin_text:
+        return (stdin_text or "").strip()
+    return ""
+
+
+def resolve_sql(args) -> str:
+    file_text = None
+    sql_file = getattr(args, "sql_file", "")
+    if sql_file:
+        try:
+            with open(sql_file, "r", encoding="utf-8") as fh:
+                file_text = fh.read()
+        except OSError as exc:
+            print(f"[ERROR] Cannot read --sql-file: {exc}", file=sys.stderr)
+            sys.exit(1)
+    stdin_text = None
+    positional = getattr(args, "sql", "") or ""
+    sql_flag = getattr(args, "sql_flag", "") or ""
+    if not file_text and not sql_flag and (positional == "-" or (not positional and not sys.stdin.isatty())):
+        stdin_text = sys.stdin.read()
+    sql = choose_sql(positional, sql_flag, file_text, stdin_text)
+    if not sql:
+        print(
+            "[ERROR] SQL is required. Use a positional statement, --sql, --sql-file, or stdin.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return sql
+
+
+def truncate_error_body(body: str, limit: int = _ERROR_BODY_LIMIT) -> str:
+    body = body.replace("\r", " ").replace("\n", " ")
+    if len(body) > limit:
+        return body[:limit] + "...(truncated)"
+    return body
+
+
+def histogram_interval_sql(spec: str) -> str:
+    """Map 5m/1h/1d to OpenObserve histogram interval text."""
+    spec = spec.strip()
+    match = re.match(r"^(\d+)([smhd])$", spec)
+    if not match:
+        raise ValueError(f"Unknown histogram interval '{spec}'. Use e.g. 5m / 1h / 1d.")
+    value, unit = match.group(1), match.group(2)
+    names = {"s": "second", "m": "minute", "h": "hour", "d": "day"}
+    return f"{int(value)} {names[unit]}"
+
+
+def pick_log_message(hit: dict) -> str:
+    for key in ("log", "message", "msg"):
+        value = hit.get(key)
+        if value:
+            return str(value)
+    dumped = json.dumps(hit, ensure_ascii=False)
+    if len(dumped) > _MSG_FALLBACK_LIMIT:
+        return dumped[:_MSG_FALLBACK_LIMIT] + "..."
+    return dumped
+
+
+def api_request(method: str, url: str, headers: dict, body: dict = None, fatal: bool = True):
     data = json.dumps(body).encode() if body else None
     req = Request(url, data=data, headers=headers, method=method)
     try:
-        with urlopen(req, timeout=60) as resp:
+        with urlopen(req, timeout=http_timeout()) as resp:
             raw = resp.read().decode()
             return json.loads(raw) if raw.strip() else {}
     except HTTPError as e:
-        error_body = e.read().decode()
+        error_body = truncate_error_body(e.read().decode(errors="replace"))
         print(f"[ERROR] HTTP {e.code}: {error_body}", file=sys.stderr)
-        sys.exit(1)
+        if fatal:
+            sys.exit(1)
+        return {}
     except URLError as e:
         print(f"[ERROR] Connection failed: {e.reason}", file=sys.stderr)
-        sys.exit(1)
+        if fatal:
+            sys.exit(1)
+        return {}
 
 
-def api_get(url: str, headers: dict) -> dict:
-    return api_request("GET", url, headers)
+def api_get(url: str, headers: dict, fatal: bool = True):
+    return api_request("GET", url, headers, fatal=fatal)
 
 
 def fmt_ts_us(ts_us: int) -> str:
@@ -108,31 +280,123 @@ def fmt_ts_s(ts_s: float) -> str:
     return datetime.fromtimestamp(float(ts_s), tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _cell(hit: dict, key: str) -> str:
+    if key == "_timestamp":
+        ts = hit.get("_timestamp", 0)
+        try:
+            return fmt_ts_us(int(ts))
+        except (TypeError, ValueError, OSError):
+            return str(ts)
+    value = hit.get(key, "")
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    if len(text) > _CELL_LIMIT:
+        return text[:_CELL_LIMIT] + "..."
+    return text
+
+
+def _csv_escape(text: str) -> str:
+    if any(ch in text for ch in ',\"\n'):
+        return '"' + text.replace('"', '""') + '"'
+    return text
+
+
+def infer_compact_fields(hits: list) -> list:
+    if not hits:
+        return list(_COMPACT_FIELDS[:3])
+    sample = hits[:10]
+    fields = [name for name in _COMPACT_FIELDS if any(name in hit for hit in sample)]
+    if not fields:
+        fields = list(hits[0].keys())[:8]
+    return fields
+
+
+def format_hits(hits: list, fields: str = "", out_format: str = "jsonl"):
+    field_list = [f.strip() for f in fields.split(",") if f.strip()] if fields else None
+    if out_format == "jsonl":
+        for hit in hits:
+            row = {k: hit.get(k, "") for k in field_list} if field_list else hit
+            print(json.dumps(row, ensure_ascii=False))
+        return
+    if not hits:
+        return
+    if not field_list:
+        field_list = infer_compact_fields(hits)
+    if out_format == "csv":
+        print(",".join(field_list))
+        for hit in hits:
+            print(",".join(_csv_escape(_cell(hit, k)) for k in field_list))
+        return
+    if out_format == "md":
+        print("| " + " | ".join(field_list) + " |")
+        print("| " + " | ".join("---" for _ in field_list) + " |")
+        for hit in hits:
+            print("| " + " | ".join(_cell(hit, k).replace("|", "\\|") for k in field_list) + " |")
+        return
+    widths = {}
+    for key in field_list:
+        widths[key] = max(len(key), min(_CELL_LIMIT, max(len(_cell(hit, key)) for hit in hits)))
+    print("  ".join(key.ljust(widths[key]) for key in field_list))
+    print("  ".join("-" * widths[key] for key in field_list))
+    for hit in hits:
+        print("  ".join(_cell(hit, key).ljust(widths[key]) for key in field_list))
+
+
+def search_payload(sql: str, start_us: int, end_us: int, size: int, offset: int = 0, out_format: str = "jsonl") -> dict:
+    payload = {
+        "query": {
+            "sql": sql,
+            "start_time": start_us,
+            "end_time": end_us,
+            "from": offset,
+            "size": size,
+        },
+        "timeout": int(http_timeout()),
+    }
+    if out_format == "csv":
+        payload["agent_options"] = {"output_format": "csv"}
+    elif out_format == "md":
+        payload["agent_options"] = {"output_format": "md_table"}
+    return payload
+
+
+def print_search_result(result: dict, fields: str = "", out_format: str = "jsonl", title: str = "# Search Results"):
+    hits = result.get("hits", [])
+    total = result.get("total", len(hits) if isinstance(hits, list) else 0)
+    took = result.get("took", 0)
+    print(f"{title}  |  total={total}  took={took}ms  returned={len(hits) if isinstance(hits, list) else '?'}\n")
+    if isinstance(hits, str):
+        print(hits)
+        return
+    if not isinstance(hits, list):
+        print(json.dumps(result, ensure_ascii=False))
+        return
+    format_hits(hits, fields, out_format)
+
+
+def schema_field_names(base_url, org, headers, stream) -> set:
+    encoded = quote(stream, safe="")
+    result = api_get(f"{base_url}/api/{org}/{encoded}/schema", headers, fatal=False)
+    return {field.get("name") for field in result.get("schema", []) if field.get("name")}
+
+
+def stream_or_default(args) -> str:
+    if not getattr(args, "stream", ""):
+        print('[WARN] stream omitted; querying "default". Pass a stream name explicitly.', file=sys.stderr)
+        return "default"
+    return args.stream
+
+
 # ---------------------------------------------------------------------------
 # LOGS commands
 # ---------------------------------------------------------------------------
 
 def cmd_search(args, base_url, org, headers):
-    start_us = parse_time_offset_us(args.since)
-    end_us = now_us()
-    payload = {
-        "query": {
-            "sql": args.sql,
-            "start_time": start_us,
-            "end_time": end_us,
-            "from": args.offset,
-            "size": args.size,
-        }
-    }
+    sql = resolve_sql(args)
+    start_us, end_us = resolve_range_us(args.since, getattr(args, "until", ""))
+    out_format = getattr(args, "out_format", "jsonl")
+    payload = search_payload(sql, start_us, end_us, args.size, args.offset, out_format)
     result = api_request("POST", f"{base_url}/api/{org}/_search", headers, payload)
-    hits = result.get("hits", [])
-    total = result.get("total", len(hits))
-    took = result.get("took", 0)
-    print(f"# Search Results  |  total={total}  took={took}ms  returned={len(hits)}\n")
-    field_list = [f.strip() for f in args.fields.split(",")] if args.fields else None
-    for hit in hits:
-        row = {k: hit.get(k, "") for k in field_list} if field_list else hit
-        print(json.dumps(row, ensure_ascii=False))
+    print_search_result(result, args.fields, out_format)
 
 
 def cmd_streams(args, base_url, org, headers):
@@ -162,79 +426,128 @@ def cmd_schema(args, base_url, org, headers):
 
 
 def cmd_tail(args, base_url, org, headers):
-    start_us = parse_time_offset_us(args.since)
-    payload = {
-        "query": {
-            "sql": f'SELECT * FROM "{args.stream}" ORDER BY _timestamp DESC',
-            "start_time": start_us,
-            "end_time": now_us(),
-            "from": 0,
-            "size": args.n,
-        }
-    }
+    start_us, end_us = resolve_range_us(args.since, getattr(args, "until", ""))
+    payload = search_payload(
+        f'SELECT * FROM "{args.stream}" ORDER BY _timestamp DESC',
+        start_us, end_us, args.n, 0, "jsonl",
+    )
     result = api_request("POST", f"{base_url}/api/{org}/_search", headers, payload)
     hits = result.get("hits", [])
     total = result.get("total", 0)
     print(f"# Tail '{args.stream}'  |  total_in_range={total}  showing={len(hits)}\n")
     for hit in hits:
         ts = hit.get("_timestamp", 0)
-        msg = hit.get("log", hit.get("message", hit.get("msg", json.dumps(hit, ensure_ascii=False))))
+        msg = pick_log_message(hit)
         print(f"[{fmt_ts_us(ts)}] {msg}")
 
 
 def cmd_errors(args, base_url, org, headers):
-    start_us = parse_time_offset_us(args.since)
-    level_filter = "match_all('error') OR match_all('ERROR') OR match_all('FATAL') OR match_all('fatal') OR match_all('panic')"
-    if args.level == "warn":
-        level_filter += " OR match_all('WARN') OR match_all('warn') OR match_all('warning')"
-    stream_clause = f'FROM "{args.stream}"' if args.stream else 'FROM "default"'
-    sql = f"SELECT * {stream_clause} WHERE {level_filter} ORDER BY _timestamp DESC"
-    payload = {
-        "query": {
-            "sql": sql,
-            "start_time": start_us,
-            "end_time": now_us(),
-            "from": 0,
-            "size": args.size,
-        }
-    }
+    stream = stream_or_default(args)
+    start_us, end_us = resolve_range_us(args.since, getattr(args, "until", ""))
+    names = schema_field_names(base_url, org, headers, stream)
+    if "level" in names:
+        levels = ["ERROR", "error", "FATAL", "fatal", "PANIC", "panic"]
+        if args.level == "warn":
+            levels.extend(["WARN", "warn", "WARNING", "warning"])
+        level_filter = " OR ".join(f"level = '{lv}'" for lv in levels)
+    else:
+        level_filter = "match_all('error') OR match_all('ERROR') OR match_all('FATAL') OR match_all('fatal') OR match_all('panic')"
+        if args.level == "warn":
+            level_filter += " OR match_all('WARN') OR match_all('warn') OR match_all('warning')"
+    sql = f'SELECT * FROM "{stream}" WHERE {level_filter} ORDER BY _timestamp DESC'
+    payload = search_payload(sql, start_us, end_us, args.size, 0, "jsonl")
     result = api_request("POST", f"{base_url}/api/{org}/_search", headers, payload)
     hits = result.get("hits", [])
     total = result.get("total", 0)
-    print(f"# Error Logs '{args.stream or 'default'}'  |  total={total}  showing={len(hits)}\n")
+    print(f"# Error Logs '{stream}'  |  total={total}  showing={len(hits)}\n")
     for hit in hits:
         ts = hit.get("_timestamp", 0)
-        msg = hit.get("log", hit.get("message", hit.get("msg", "")))
+        msg = pick_log_message(hit)
         level = hit.get("level", hit.get("severity", ""))
         print(f"[{fmt_ts_us(ts)}] [{level}] {msg}")
 
 
 def cmd_summary(args, base_url, org, headers):
-    start_us = parse_time_offset_us(args.since)
-    end_us = now_us()
-    stream_clause = f'FROM "{args.stream}"' if args.stream else 'FROM "default"'
+    stream = stream_or_default(args)
+    start_us, end_us = resolve_range_us(args.since, getattr(args, "until", ""))
+    names = schema_field_names(base_url, org, headers, stream)
+    group_field = "level" if "level" in names else ("status" if "status" in names else "level")
+    stream_clause = f'FROM "{stream}"'
     url = f"{base_url}/api/{org}/_search"
 
-    r_level = api_request("POST", url, headers, {
-        "query": {
-            "sql": f"SELECT level, COUNT(*) AS cnt {stream_clause} GROUP BY level ORDER BY cnt DESC",
-            "start_time": start_us, "end_time": end_us, "from": 0, "size": 100
-        }
-    })
-    r_total = api_request("POST", url, headers, {
-        "query": {
-            "sql": f"SELECT COUNT(*) AS total {stream_clause}",
-            "start_time": start_us, "end_time": end_us, "from": 0, "size": 1
-        }
-    })
+    r_level = api_request("POST", url, headers, search_payload(
+        f"SELECT {group_field}, COUNT(*) AS cnt {stream_clause} GROUP BY {group_field} ORDER BY cnt DESC",
+        start_us, end_us, 100, 0, "jsonl",
+    ))
+    r_total = api_request("POST", url, headers, search_payload(
+        f"SELECT COUNT(*) AS total {stream_clause}",
+        start_us, end_us, 1, 0, "jsonl",
+    ))
 
-    print(f"# Log Summary '{args.stream or 'default'}' (past {args.since})\n")
+    print(f"# Log Summary '{stream}' (past {args.since})\n")
     print("## By Level")
     for row in r_level.get("hits", []):
-        print(f"  {row.get('level','unknown'):<15} {row.get('cnt', 0)}")
+        print(f"  {str(row.get(group_field, 'unknown')):<15} {row.get('cnt', 0)}")
     hits_t = r_total.get("hits", [])
     total = hits_t[0].get("total", "?") if hits_t else "?"
     print(f"\n## Total entries: {total}")
+
+
+def cmd_around(args, base_url, org, headers):
+    key_us = parse_time_us(args.at)
+    params = urlencode({"key": key_us, "size": args.size})
+    encoded = quote(args.stream, safe="")
+    url = f"{base_url}/api/{org}/{encoded}/_around?{params}"
+    result = api_get(url, headers)
+    out_format = getattr(args, "out_format", "jsonl")
+    print_search_result(result, args.fields, out_format, title=f"# Around '{args.stream}'")
+
+
+def cmd_values(args, base_url, org, headers):
+    start_us, end_us = resolve_range_us(args.since, getattr(args, "until", ""))
+    params = {
+        "fields": args.fields,
+        "start_time": start_us,
+        "end_time": end_us,
+        "size": args.size,
+    }
+    if args.keyword:
+        params["keyword"] = args.keyword
+    encoded = quote(args.stream, safe="")
+    url = f"{base_url}/api/{org}/{encoded}/_values?{urlencode(params)}"
+    result = api_get(url, headers)
+    hits = result.get("hits", [])
+    print(f"# Values '{args.stream}'  |  fields={args.fields}  groups={len(hits)}\n")
+    for group in hits:
+        field = group.get("field", "?")
+        values = group.get("values", [])
+        print(f"  {field}")
+        for item in values:
+            key = item.get("zo_sql_key", item)
+            num = item.get("zo_sql_num", "")
+            extra = f"  {num}" if num != "" else ""
+            print(f"    {key}{extra}")
+
+
+def cmd_histogram(args, base_url, org, headers):
+    start_us, end_us = resolve_range_us(args.since, getattr(args, "until", ""))
+    try:
+        interval = histogram_interval_sql(args.interval)
+    except ValueError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        sys.exit(1)
+    sql = (
+        f'SELECT histogram(_timestamp, \'{interval}\') AS ts, COUNT(*) AS cnt '
+        f'FROM "{args.stream}" GROUP BY ts ORDER BY ts'
+    )
+    payload = search_payload(sql, start_us, end_us, args.size, 0, "jsonl")
+    result = api_request("POST", f"{base_url}/api/{org}/_search", headers, payload)
+    hits = result.get("hits", [])
+    print(f"# Histogram '{args.stream}'  |  interval={args.interval}  buckets={len(hits)}\n")
+    for row in hits:
+        ts = row.get("ts", row.get("histogram", ""))
+        cnt = row.get("cnt", row.get("count", 0))
+        print(f"  {ts}  {cnt}")
 
 
 # ---------------------------------------------------------------------------
@@ -305,8 +618,7 @@ def cmd_metrics_list(args, base_url, org, headers):
 
 def cmd_traces_latest(args, base_url, org, headers):
     """List recent traces from a stream."""
-    start_us = parse_time_offset_us(args.since)
-    end_us = now_us()
+    start_us, end_us = resolve_range_us(args.since, "")
     params = urlencode({
         "start_time": start_us,
         "end_time": end_us,
@@ -333,17 +645,9 @@ def cmd_traces_latest(args, base_url, org, headers):
 
 def cmd_traces_get(args, base_url, org, headers):
     """Get all spans for a specific trace_id using Search API."""
-    start_us = parse_time_offset_us(args.since)
+    start_us, end_us = resolve_range_us(args.since, "")
     sql = f'SELECT * FROM "{args.stream or "default"}" WHERE trace_id = \'{args.trace_id}\' ORDER BY start_time'
-    payload = {
-        "query": {
-            "sql": sql,
-            "start_time": start_us,
-            "end_time": now_us(),
-            "from": 0,
-            "size": -1,
-        }
-    }
+    payload = search_payload(sql, start_us, end_us, -1, 0, "jsonl")
     result = api_request("POST", f"{base_url}/api/{org}/_search", headers, payload)
     spans = result.get("hits", [])
     print(f"# Trace Detail  |  trace_id={args.trace_id}  spans={len(spans)}\n")
@@ -359,7 +663,7 @@ def cmd_traces_get(args, base_url, org, headers):
 
 def cmd_traces_search(args, base_url, org, headers):
     """Search traces by service, min duration, or error status."""
-    start_us = parse_time_offset_us(args.since)
+    start_us, end_us = resolve_range_us(args.since, "")
     stream = args.stream or "default"
 
     conditions = []
@@ -373,15 +677,7 @@ def cmd_traces_search(args, base_url, org, headers):
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
     sql = f'SELECT * FROM "{stream}" {where} ORDER BY _timestamp DESC'
 
-    payload = {
-        "query": {
-            "sql": sql,
-            "start_time": start_us,
-            "end_time": now_us(),
-            "from": 0,
-            "size": args.size,
-        }
-    }
+    payload = search_payload(sql, start_us, end_us, args.size, 0, "jsonl")
     result = api_request("POST", f"{base_url}/api/{org}/_search", headers, payload)
     hits = result.get("hits", [])
     total = result.get("total", 0)
@@ -422,6 +718,7 @@ def cmd_alerts_list(args, base_url, org, headers):
 # ---------------------------------------------------------------------------
 
 def main():
+    _load_dotenv()
     base_url = os.environ.get("OO_BASE_URL", "").rstrip("/")
     org = os.environ.get("OO_ORG", "default")
     user = os.environ.get("OO_USER", "")
@@ -447,11 +744,17 @@ def main():
 
     # ── LOGS ──────────────────────────────────────────────────
     p = sub.add_parser("search", help="[LOGS] Run SQL query")
-    p.add_argument("sql", help="SQL statement")
+    p.add_argument("sql", nargs="?", default="", help="SQL statement, or '-' to read stdin")
+    p.add_argument("--sql", dest="sql_flag", default="", help="SQL statement (PowerShell-friendly)")
+    p.add_argument("--sql-file", dest="sql_file", default="", help="Read SQL from a file")
     p.add_argument("--since", default="1h")
+    p.add_argument("--until", default="", help="End time: 15m/1h/2d or absolute timestamp")
     p.add_argument("--size", type=int, default=20)
     p.add_argument("--offset", type=int, default=0)
     p.add_argument("--fields", default="")
+    p.add_argument("--format", dest="out_format", default="jsonl",
+                   choices=["jsonl", "compact", "csv", "md"],
+                   help="Output format (default jsonl; use jsonl for oo_analyze.py)")
 
     p = sub.add_parser("streams", help="[LOGS] List streams")
     p.add_argument("--type", default="logs", choices=["logs", "metrics", "traces"])
@@ -464,16 +767,42 @@ def main():
     p.add_argument("stream")
     p.add_argument("-n", type=int, default=20)
     p.add_argument("--since", default="1h")
+    p.add_argument("--until", default="")
 
     p = sub.add_parser("errors", help="[LOGS] Find error logs")
     p.add_argument("stream", nargs="?", default="")
     p.add_argument("--since", default="1h")
+    p.add_argument("--until", default="")
     p.add_argument("--size", type=int, default=50)
     p.add_argument("--level", default="error", choices=["error", "warn"])
 
     p = sub.add_parser("summary", help="[LOGS] Log count summary")
     p.add_argument("stream", nargs="?", default="")
     p.add_argument("--since", default="1h")
+    p.add_argument("--until", default="")
+
+    p = sub.add_parser("around", help="[LOGS] Logs around a timestamp")
+    p.add_argument("stream")
+    p.add_argument("--at", required=True, help="Center timestamp: 15m/1h/2d or absolute")
+    p.add_argument("--size", type=int, default=10)
+    p.add_argument("--fields", default="")
+    p.add_argument("--format", dest="out_format", default="jsonl",
+                   choices=["jsonl", "compact", "csv", "md"])
+
+    p = sub.add_parser("values", help="[LOGS] Distinct field values")
+    p.add_argument("stream")
+    p.add_argument("--fields", required=True, help="Comma-separated field names")
+    p.add_argument("--since", default="1h")
+    p.add_argument("--until", default="")
+    p.add_argument("--size", type=int, default=10)
+    p.add_argument("--keyword", default="")
+
+    p = sub.add_parser("histogram", help="[LOGS] Time histogram")
+    p.add_argument("stream")
+    p.add_argument("--interval", default="5m", help="Bucket size, e.g. 5m / 1h")
+    p.add_argument("--since", default="1h")
+    p.add_argument("--until", default="")
+    p.add_argument("--size", type=int, default=1000)
 
     # ── METRICS ───────────────────────────────────────────────
     p = sub.add_parser("metrics-query", help="[METRICS] Instant PromQL query")
@@ -522,6 +851,9 @@ def main():
         "tail": cmd_tail,
         "errors": cmd_errors,
         "summary": cmd_summary,
+        "around": cmd_around,
+        "values": cmd_values,
+        "histogram": cmd_histogram,
         "metrics-query": cmd_metrics_query,
         "metrics-range": cmd_metrics_range,
         "metrics-list": cmd_metrics_list,
