@@ -80,6 +80,8 @@
 │  └─ requirements-analysis.md
 ├─ references/
 │  └─ api_reference.md
+├─ tests/
+│  └─ test_cli_unit.py
 └─ scripts/
    ├─ oo_analyze.py
    └─ oo_client.py
@@ -105,6 +107,8 @@
 | `OO_ORG` | 组织名 | `default` |
 | `OO_USER` | 用户名 | `root@example.com` |
 | `OO_PASSWORD` | 密码 | `Complexpass#123` |
+
+也可将以上变量写入 `scripts/.env` 或项目根目录 `.env`（已存在的环境变量优先）。可选：`OO_TZ`（默认 UTC）、`OO_TIMEOUT`（默认 60 秒）。
 
 PowerShell 示例：
 
@@ -147,6 +151,12 @@ python scripts/oo_client.py errors my_stream --since 2h --size 100
 python scripts/oo_client.py search "SELECT * FROM \"mystream\" WHERE match_all('timeout')" --since 1h
 ```
 
+PowerShell 下更稳妥的写法是 `--sql` 加外层单引号：
+
+```powershell
+python scripts/oo_client.py search --sql 'SELECT * FROM "mystream" WHERE match_all(''timeout'')' --since 1h
+```
+
 ### 6. 查询指标
 
 ```powershell
@@ -175,6 +185,24 @@ python scripts/oo_client.py traces-search --service order-service --min-duration
 
 ```powershell
 python scripts/oo_client.py alerts-list
+```
+
+### 11. 查看某时刻附近的日志
+
+```powershell
+python scripts/oo_client.py around my_stream --at 2024-01-01T12:00:00Z --size 10
+```
+
+### 12. 查看字段取值
+
+```powershell
+python scripts/oo_client.py values my_stream --fields level,service --since 1h
+```
+
+### 13. 按时间分桶统计
+
+```powershell
+python scripts/oo_client.py histogram my_stream --interval 5m --since 1h
 ```
 
 ## 日志二次分析
@@ -212,6 +240,9 @@ python scripts/oo_client.py search "SELECT * FROM \"mystream\"" --since 6h --siz
   - `tail`
   - `errors`
   - `summary`
+  - `around`
+  - `values`
+  - `histogram`
 - Metrics
   - `metrics-query`
   - `metrics-range`
@@ -269,6 +300,12 @@ python scripts/oo_client.py metrics-query "sum by (service) (rate(http_requests_
 python scripts/oo_client.py traces-search --since 1h --min-duration-ms 500
 ```
 
+### 场景 5：查看某条日志前后文
+
+```powershell
+python scripts/oo_client.py around app_logs --at 2024-01-01T12:00:00Z --size 10
+```
+
 ## 开发说明
 
 ### Skill 入口
@@ -308,6 +345,9 @@ python scripts/oo_client.py traces-search --since 1h --min-duration-ms 500
 - 对日志进行管道分析前，建议先通过 SQL 缩小数据范围。
 - 对于日志查询，`--size` 不宜设置过大；更大数据量建议分页获取。
 - 含特殊字符的 Stream 名建议使用双引号。
+- PowerShell 执行 SQL 时建议使用 `--sql 'SELECT * FROM "mystream" LIMIT 20'`。
+- `search` 默认输出 jsonl，可与 `oo_analyze.py` 管道衔接；阅读样本时可加 `--format compact`。
+- `--until` 支持相对时间或绝对时间，未指定时截止到当前。
 
 ## 后续可扩展方向
 
