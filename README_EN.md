@@ -80,8 +80,6 @@ Performs secondary analysis on log query results:
 │  └─ requirements-analysis.md
 ├─ references/
 │  └─ api_reference.md
-├─ tests/
-│  └─ test_cli_unit.py
 └─ scripts/
    ├─ oo_analyze.py
    └─ oo_client.py
