@@ -33,6 +33,8 @@ Default organization: `default`
 - `start_time` / `end_time`: **microseconds** since Unix epoch
 - `size`: use `-1` to return all (Traces only; use with caution on logs)
 - `from`: pagination offset
+- `timeout`: query timeout in seconds (CLI sends the HTTP timeout value)
+- `agent_options.output_format`: `json` (default) | `csv` | `md_table`
 
 **Response:**
 ```json
@@ -84,6 +86,34 @@ GET /api/{org}/streams?type=logs&fetchSchema=true
 ```
 GET /api/{org}/{stream}/schema
 ```
+
+---
+
+## LOGS — Around API
+
+**GET** `/api/{org}/{stream}/_around`
+
+Query parameters:
+
+- `key`: `_timestamp` of the record to search around (microseconds)
+- `size`: number of records to return
+
+CLI: `python scripts/oo_client.py around <stream> --at <ts> --size 10`
+
+---
+
+## LOGS — Values API
+
+**GET** `/api/{org}/{stream}/_values`
+
+Query parameters:
+
+- `fields`: comma-separated field names (required)
+- `start_time` / `end_time`: time range (microseconds)
+- `size`: number of values to return
+- `keyword`: optional filter
+
+CLI: `python scripts/oo_client.py values <stream> --fields level,service --since 1h`
 
 ---
 
