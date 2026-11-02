@@ -23,6 +23,8 @@ API 参考：`references/api_reference.md`
 | `OO_USER` | 用户名 | `root@example.com` |
 | `OO_PASSWORD` | 密码 | `Complexpass#123` |
 
+脚本会自动加载 `scripts/.env` 或项目根目录 `.env`（已存在的环境变量优先）。
+
 **未设置时提示用户执行（PowerShell）：**
 ```powershell
 $env:OO_BASE_URL="http://localhost:5080"
@@ -44,7 +46,10 @@ $env:OO_PASSWORD="your-password"
   ├─ "日志量统计"            → summary
   ├─ "有什么常见问题/模式"   → search | oo_analyze.py patterns
   ├─ "日志趋势分布"          → search | oo_analyze.py timeline
-  └─ "有哪些数据流/字段"     → streams / schema
+  ├─ "有哪些数据流/字段"     → streams / schema
+  ├─ "某时刻附近的日志"      → around
+  ├─ "字段有哪些取值"        → values
+  └─ "按时间分桶统计"        → histogram
 
   METRICS（指标）
   ├─ "当前 XX 指标是多少"    → metrics-query
@@ -99,6 +104,21 @@ python scripts/oo_client.py search "SELECT * FROM \"mystream\" WHERE match_all('
 
 # 按级别统计
 python scripts/oo_client.py search "SELECT level, COUNT(*) AS cnt FROM \"mystream\" GROUP BY level ORDER BY cnt DESC" --since 24h
+
+# PowerShell：用 --sql 和外层单引号，避免 \" 被吞掉
+python scripts/oo_client.py search --sql 'SELECT * FROM "mystream" LIMIT 20' --since 1h
+```
+
+### 按时间点 / 字段取值 / 分桶
+```bash
+# 某条日志前后文
+python scripts/oo_client.py around <stream_name> --at 2024-01-01T12:00:00Z --size 10
+
+# 字段去重取值
+python scripts/oo_client.py values <stream_name> --fields level,service --since 1h
+
+# 按时间分桶计数
+python scripts/oo_client.py histogram <stream_name> --interval 5m --since 1h
 ```
 
 ### 深度分析（管道）
@@ -215,3 +235,6 @@ python scripts/oo_client.py alerts-list
 4. **Traces 的 `traces-get` 使用 `size=-1`** 拉取全部 span。
 5. **管道分析先过滤**：缩小数据集后再管道给 `oo_analyze.py`。
 6. **`--size` 建议 ≤ 500**；更多数据用 `--offset` 分页。
+7. **PowerShell 查询用 `--sql` + 外层单引号**，例如 `--sql 'SELECT * FROM "mystream" LIMIT 20'`，不要写 `\"`。
+8. **Agent 阅读日志可用 `--format compact`**；管道给 `oo_analyze.py` 时保持默认 `jsonl`。
+9. **`--until` 支持 `15m` / `1h` / `2d` 或绝对时间**；未指定时截止到当前。

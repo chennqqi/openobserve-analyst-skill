@@ -104,6 +104,8 @@ Before running any script, configure the following environment variables:
 | `OO_USER` | Username | `root@example.com` |
 | `OO_PASSWORD` | Password | `Complexpass#123` |
 
+You can also put these variables in `scripts/.env` or a project-root `.env` (existing environment variables take precedence). Optional: `OO_TZ` (default UTC), `OO_TIMEOUT` (default 60 seconds).
+
 PowerShell example:
 
 ```powershell
@@ -145,6 +147,12 @@ python scripts/oo_client.py errors my_stream --since 2h --size 100
 python scripts/oo_client.py search "SELECT * FROM \"mystream\" WHERE match_all('timeout')" --since 1h
 ```
 
+On PowerShell, `--sql` with outer single quotes is more reliable:
+
+```powershell
+python scripts/oo_client.py search --sql 'SELECT * FROM "mystream" WHERE match_all(''timeout'')' --since 1h
+```
+
 ### 6. Query metrics
 
 ```powershell
@@ -173,6 +181,24 @@ python scripts/oo_client.py traces-search --service order-service --min-duration
 
 ```powershell
 python scripts/oo_client.py alerts-list
+```
+
+### 11. Fetch logs around a timestamp
+
+```powershell
+python scripts/oo_client.py around my_stream --at 2024-01-01T12:00:00Z --size 10
+```
+
+### 12. List distinct field values
+
+```powershell
+python scripts/oo_client.py values my_stream --fields level,service --since 1h
+```
+
+### 13. Time histogram
+
+```powershell
+python scripts/oo_client.py histogram my_stream --interval 5m --since 1h
 ```
 
 ## Secondary Log Analysis
@@ -210,6 +236,9 @@ The commands are grouped by capability:
   - `tail`
   - `errors`
   - `summary`
+  - `around`
+  - `values`
+  - `histogram`
 - Metrics
   - `metrics-query`
   - `metrics-range`
@@ -267,6 +296,12 @@ python scripts/oo_client.py metrics-query "sum by (service) (rate(http_requests_
 python scripts/oo_client.py traces-search --since 1h --min-duration-ms 500
 ```
 
+### Scenario 5: Inspect logs around a given timestamp
+
+```powershell
+python scripts/oo_client.py around app_logs --at 2024-01-01T12:00:00Z --size 10
+```
+
 ## Development Notes
 
 ### Skill Entry
@@ -304,6 +339,9 @@ It includes:
 - Log and trace queries should always limit the time range reasonably to avoid scanning too much data.
 - `--since` supports formats such as `15m`, `1h`, and `2d`.
 - Before piping log data into `oo_analyze.py`, it is recommended to narrow down the dataset with SQL first.
+- On PowerShell, prefer `--sql 'SELECT * FROM "mystream" LIMIT 20'`.
+- `search` defaults to jsonl so it can pipe into `oo_analyze.py`; use `--format compact` when an Agent is reading samples.
+- `--until` accepts relative or absolute time; when omitted, the end time is now.
 - For log queries, avoid setting `--size` too large. Use pagination for larger datasets.
 - Stream names containing special characters should be wrapped in double quotes.
 
